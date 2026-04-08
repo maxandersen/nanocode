@@ -1,6 +1,6 @@
 # nanocode
 
-Minimal Claude Code alternative. Single Java file, runnable with [jbang](https://jbang.dev), zero..eh..1 json dependency, ~390 lines.
+Minimal Claude Code alternative. Single Java file, runnable with [jbang](https://jbang.dev), zero..eh..1 json dependency, ~260 lines.
 
 Built using Claude Code, then used to build itself.
 

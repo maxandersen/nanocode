@@ -5,22 +5,19 @@
 import module java.base;
 
 import static java.lang.System.getenv;
-import static java.nio.file.Files.exists;
-import static java.nio.file.Files.readString;
-import static java.nio.file.Files.writeString;
+import static java.nio.file.Files.*;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 
 /**
- * nanocode - minimal claude code alternative (Java port)
- * Original: https://github.com/1rgs/nanocode
+ * nanocode - minimal claude code alternative. Original:
+ * https://github.com/1rgs/nanocode
  */
 
 static final ObjectMapper JSON = new ObjectMapper();
-
-static final PrintStream IO = System.out;
 
 static final String OPENROUTER_KEY = getenv("OPENROUTER_API_KEY");
 static final String API_URL = OPENROUTER_KEY != null
@@ -29,22 +26,17 @@ static final String API_URL = OPENROUTER_KEY != null
 static final String MODEL = Optional.ofNullable(getenv("MODEL"))
         .orElse(OPENROUTER_KEY != null ? "anthropic/claude-opus-4.5" : "claude-opus-4-5");
 
-// ANSI colors
 static final String RESET = "\033[0m", BOLD = "\033[1m", DIM = "\033[2m";
-static final String BLUE = "\033[34m", CYAN = "\033[36m", GREEN = "\033[32m";
-static final String YELLOW = "\033[33m", RED = "\033[31m";
+static final String BLUE = "\033[34m", CYAN = "\033[36m", GREEN = "\033[32m", RED = "\033[31m";
 
-// --- Tool implementations ---
+// --- Tools ---
 
 static String toolRead(JsonNode args) throws IOException {
-    var path = args.get("path").asText();
-    var lines = Files.readAllLines(Path.of(path));
-    int offset = args.has("offset") ? args.get("offset").asInt() : 0;
-    int limit = args.has("limit") ? args.get("limit").asInt() : lines.size();
+    var lines = readAllLines(Path.of(args.get("path").asText()));
+    int offset = args.path("offset").asInt(0), limit = args.path("limit").asInt(lines.size());
     var sb = new StringBuilder();
-    for (int i = offset; i < Math.min(offset + limit, lines.size()); i++) {
-        sb.append(String.format("%4d| %s%n", i + 1, lines.get(i)));
-    }
+    for (int i = offset; i < Math.min(offset + limit, lines.size()); i++)
+        sb.append("%4d| %s%n".formatted(i + 1, lines.get(i)));
     return sb.toString();
 }
 
@@ -57,133 +49,71 @@ static String toolEdit(JsonNode args) throws IOException {
     var path = Path.of(args.get("path").asText());
     var text = readString(path);
     var old = args.get("old").asText();
-    var replacement = args.get("new").asText();
-    boolean all = args.has("all") && args.get("all").asBoolean();
-
+    var repl = args.get("new").asText();
     if (!text.contains(old))
         return "error: old_string not found";
-
-    long count = countOccurrences(text, old);
-    if (!all && count > 1) {
+    int count = (text.length() - text.replace(old, "").length()) / old.length();
+    if (!args.path("all").asBoolean() && count > 1)
         return "error: old_string appears " + count + " times, must be unique (use all=true)";
-    }
-
-    String result = all ? text.replace(old, replacement) : replaceFirst(text, old, replacement);
-    writeString(path, result);
+    writeString(path, args.path("all").asBoolean()
+            ? text.replace(old, repl)
+            : text.replaceFirst(Pattern.quote(old), Matcher.quoteReplacement(repl)));
     return "ok";
 }
 
-static long countOccurrences(String text, String sub) {
-    long count = 0;
-    int idx = 0;
-    while ((idx = text.indexOf(sub, idx)) != -1) {
-        count++;
-        idx += sub.length();
-    }
-    return count;
-}
-
-static String replaceFirst(String text, String old, String replacement) {
-    int idx = text.indexOf(old);
-    if (idx == -1)
-        return text;
-    return text.substring(0, idx) + replacement + text.substring(idx + old.length());
-}
-
 static String toolGlob(JsonNode args) throws IOException {
-    var basePath = args.has("path") ? args.get("path").asText() : ".";
-    var pattern = args.get("pat").asText();
-    var fullPattern = (basePath + "/" + pattern).replace("//", "/");
-
-    // Use PathMatcher with glob
-    var matcher = FileSystems.getDefault().getPathMatcher("glob:" + fullPattern);
-    var files = new ArrayList<Path>();
-
-    var root = Path.of(basePath);
-    if (!exists(root))
+    var base = Path.of(args.path("path").asText("."));
+    var matcher = FileSystems.getDefault().getPathMatcher("glob:" + base + "/" + args.get("pat").asText());
+    if (!exists(base))
         return "none";
-
-    Files.walkFileTree(root, new SimpleFileVisitor<>() {
-        @Override
-        public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
-            if (matcher.matches(file))
-                files.add(file);
-            return FileVisitResult.CONTINUE;
-        }
-
-        @Override
-        public FileVisitResult visitFileFailed(Path file, IOException exc) {
-            return FileVisitResult.CONTINUE;
-        }
-    });
-
-    files.sort((a, b) -> {
-        try {
-            return Files.getLastModifiedTime(b).compareTo(Files.getLastModifiedTime(a));
-        } catch (IOException e) {
-            return 0;
-        }
-    });
-
-    return files.isEmpty() ? "none" : files.stream().map(Path::toString).collect(Collectors.joining("\n"));
+    try (var walk = walk(base)) {
+        var files = walk.filter(Files::isRegularFile).filter(matcher::matches)
+                .sorted((a, b) -> {
+                    try {
+                        return getLastModifiedTime(b).compareTo(getLastModifiedTime(a));
+                    } catch (IOException e) {
+                        return 0;
+                    }
+                })
+                .map(Path::toString).toList();
+        return files.isEmpty() ? "none" : String.join("\n", files);
+    }
 }
 
 static String toolGrep(JsonNode args) throws IOException {
     var pattern = Pattern.compile(args.get("pat").asText());
-    var basePath = args.has("path") ? args.get("path").asText() : ".";
+    var base = Path.of(args.path("path").asText("."));
     var hits = new ArrayList<String>();
-
-    Files.walkFileTree(Path.of(basePath), new SimpleFileVisitor<>() {
-        @Override
-        public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
-            if (!attrs.isRegularFile())
-                return FileVisitResult.CONTINUE;
+    try (var walk = walk(base)) {
+        walk.filter(Files::isRegularFile).takeWhile(_ -> hits.size() < 50).forEach(file -> {
             try {
-                var lines = Files.readAllLines(file);
-                for (int i = 0; i < lines.size() && hits.size() < 50; i++) {
-                    if (pattern.matcher(lines.get(i)).find()) {
+                var lines = readAllLines(file);
+                for (int i = 0; i < lines.size() && hits.size() < 50; i++)
+                    if (pattern.matcher(lines.get(i)).find())
                         hits.add(file + ":" + (i + 1) + ":" + lines.get(i));
-                    }
-                }
             } catch (Exception e) {
-                /* skip binary/unreadable files */ }
-            return hits.size() >= 50 ? FileVisitResult.TERMINATE : FileVisitResult.CONTINUE;
-        }
-
-        @Override
-        public FileVisitResult visitFileFailed(Path file, IOException exc) {
-            return FileVisitResult.CONTINUE;
-        }
-    });
-
+                /* skip */ }
+        });
+    }
     return hits.isEmpty() ? "none" : String.join("\n", hits);
 }
 
-static String toolBash(JsonNode args) throws IOException, InterruptedException {
-    var cmd = args.get("cmd").asText();
-    var pb = new ProcessBuilder("sh", "-c", cmd)
-            .redirectErrorStream(true);
-    var proc = pb.start();
-    var outputLines = new ArrayList<String>();
-
-    try (var reader = new BufferedReader(new InputStreamReader(proc.getInputStream()))) {
+static String toolBash(JsonNode args) throws Exception {
+    var proc = new ProcessBuilder("sh", "-c", args.get("cmd").asText()).redirectErrorStream(true).start();
+    var out = new ArrayList<String>();
+    try (var r = new BufferedReader(new InputStreamReader(proc.getInputStream()))) {
         String line;
-        while ((line = reader.readLine()) != null) {
-            IO.println("  " + DIM + "│ " + line + RESET);
-            IO.flush();
-            outputLines.add(line);
+        while ((line = r.readLine()) != null) {
+            System.out.println("  " + DIM + "│ " + line + RESET);
+            out.add(line);
         }
     }
-
     if (!proc.waitFor(30, TimeUnit.SECONDS)) {
         proc.destroyForcibly();
-        outputLines.add("(timed out after 30s)");
+        out.add("(timed out after 30s)");
     }
-
-    return outputLines.isEmpty() ? "(empty)" : String.join("\n", outputLines);
+    return out.isEmpty() ? "(empty)" : String.join("\n", out);
 }
-
-// --- Tool dispatch ---
 
 static String runTool(String name, JsonNode args) {
     try {
@@ -201,114 +131,66 @@ static String runTool(String name, JsonNode args) {
     }
 }
 
-// --- Tool schema for API ---
+// --- Schema ---
 
-record ToolDef(String name, String description, String[][] params) {
-}
+static final String SCHEMA = """
+        [{"name":"read","description":"Read file with line numbers (file path, not directory)","input_schema":{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["path"]}},
+        {"name":"write","description":"Write content to file","input_schema":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}},
+        {"name":"edit","description":"Replace old with new in file (old must be unique unless all=true)","input_schema":{"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"},"all":{"type":"boolean"}},"required":["path","old","new"]}},
+        {"name":"glob","description":"Find files by pattern, sorted by mtime","input_schema":{"type":"object","properties":{"pat":{"type":"string"},"path":{"type":"string"}},"required":["pat"]}},
+        {"name":"grep","description":"Search files for regex pattern","input_schema":{"type":"object","properties":{"pat":{"type":"string"},"path":{"type":"string"}},"required":["pat"]}},
+        {"name":"bash","description":"Run shell command","input_schema":{"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"]}}]""";
 
-static final ToolDef[] TOOL_DEFS = {
-        new ToolDef("read", "Read file with line numbers (file path, not directory)",
-                new String[][] { { "path", "string", "true" }, { "offset", "integer", "false" },
-                        { "limit", "integer", "false" } }),
-        new ToolDef("write", "Write content to file",
-                new String[][] { { "path", "string", "true" }, { "content", "string", "true" } }),
-        new ToolDef("edit", "Replace old with new in file (old must be unique unless all=true)",
-                new String[][] { { "path", "string", "true" }, { "old", "string", "true" }, { "new", "string", "true" },
-                        { "all", "boolean", "false" } }),
-        new ToolDef("glob", "Find files by pattern, sorted by mtime",
-                new String[][] { { "pat", "string", "true" }, { "path", "string", "false" } }),
-        new ToolDef("grep", "Search files for regex pattern",
-                new String[][] { { "pat", "string", "true" }, { "path", "string", "false" } }),
-        new ToolDef("bash", "Run shell command",
-                new String[][] { { "cmd", "string", "true" } }),
-};
-
-static ArrayNode makeSchema() {
-    var arr = JSON.createArrayNode();
-    for (var td : TOOL_DEFS) {
-        var tool = JSON.createObjectNode();
-        tool.put("name", td.name());
-        tool.put("description", td.description());
-        var schema = JSON.createObjectNode();
-        schema.put("type", "object");
-        var props = JSON.createObjectNode();
-        var required = JSON.createArrayNode();
-        for (var p : td.params()) {
-            var prop = JSON.createObjectNode();
-            prop.put("type", p[1]);
-            props.set(p[0], prop);
-            if ("true".equals(p[2]))
-                required.add(p[0]);
-        }
-        schema.set("properties", props);
-        schema.set("required", required);
-        tool.set("input_schema", schema);
-        arr.add(tool);
-    }
-    return arr;
-}
-
-// --- API call ---
+// --- API ---
 
 static JsonNode callApi(ArrayNode messages, String systemPrompt) throws IOException {
-    var body = JSON.createObjectNode();
-    body.put("model", MODEL);
-    body.put("max_tokens", 8192);
-    body.put("system", systemPrompt);
+    var body = JSON.createObjectNode().put("model", MODEL).put("max_tokens", 8192).put("system", systemPrompt);
     body.set("messages", messages);
-    body.set("tools", makeSchema());
+    body.set("tools", JSON.readTree(SCHEMA));
 
     var conn = (HttpURLConnection) URI.create(API_URL).toURL().openConnection();
     conn.setRequestMethod("POST");
     conn.setDoOutput(true);
     conn.setRequestProperty("Content-Type", "application/json");
     conn.setRequestProperty("anthropic-version", "2023-06-01");
-    if (OPENROUTER_KEY != null) {
-        conn.setRequestProperty("Authorization", "Bearer " + OPENROUTER_KEY);
-    } else {
-        conn.setRequestProperty("x-api-key", Optional.ofNullable(getenv("ANTHROPIC_API_KEY")).orElse(""));
-    }
+    conn.setRequestProperty(OPENROUTER_KEY != null ? "Authorization" : "x-api-key",
+            OPENROUTER_KEY != null ? "Bearer " + OPENROUTER_KEY
+                    : Optional.ofNullable(getenv("ANTHROPIC_API_KEY")).orElse(""));
 
     try (var os = conn.getOutputStream()) {
         os.write(JSON.writeValueAsBytes(body));
     }
-
     int status = conn.getResponseCode();
-    InputStream is = status >= 400 ? conn.getErrorStream() : conn.getInputStream();
-    var response = JSON.readTree(is);
-
-    if (status >= 400) {
+    var response = JSON.readTree(status >= 400 ? conn.getErrorStream() : conn.getInputStream());
+    if (status >= 400)
         throw new IOException("API error " + status + ": " + response);
-    }
-
     return response;
 }
 
-// --- UI helpers ---
+// --- UI ---
 
-static String separator() {
-    int cols = 80;
+static String sep() {
     try {
-        var proc = new ProcessBuilder("tput", "cols").inheritIO().redirectOutput(ProcessBuilder.Redirect.PIPE).start();
-        var out = new String(proc.getInputStream().readAllBytes()).trim();
-        proc.waitFor();
-        cols = Math.min(Integer.parseInt(out), 80);
+        var p = new ProcessBuilder("tput", "cols").redirectErrorStream(true).start();
+        return DIM + "─".repeat(Math.min(Integer.parseInt(new String(p.getInputStream().readAllBytes()).trim()), 80))
+                + RESET;
     } catch (Exception e) {
-        /* default 80 */ }
-    return DIM + "─".repeat(cols) + RESET;
+        return DIM + "─".repeat(80) + RESET;
+    }
 }
 
-static String renderMarkdown(String text) {
-    return Pattern.compile("\\*\\*(.+?)\\*\\*").matcher(text)
-            .replaceAll(BOLD + "$1" + RESET);
+static String preview(String s, int max) {
+    var lines = s.split("\n");
+    var p = lines[0].substring(0, Math.min(lines[0].length(), max));
+    return lines.length > 1 ? p + " ... +" + (lines.length - 1) + " lines" : (lines[0].length() > max ? p + "..." : p);
 }
 
 // --- Main ---
 
 void main(String[] args) throws Exception {
     var cwd = System.getProperty("user.dir");
-    var provider = OPENROUTER_KEY != null ? "OpenRouter" : "Anthropic";
-    IO.println(BOLD + "nanocode" + RESET + " | " + DIM + MODEL + " (" + provider + ") | " + cwd + RESET + "\n");
+    System.out.println(BOLD + "nanocode" + RESET + " | " + DIM + MODEL + " ("
+            + (OPENROUTER_KEY != null ? "OpenRouter" : "Anthropic") + ") | " + cwd + RESET + "\n");
 
     var messages = JSON.createArrayNode();
     var systemPrompt = "Concise coding assistant. cwd: " + cwd;
@@ -316,99 +198,64 @@ void main(String[] args) throws Exception {
 
     while (true) {
         try {
-            IO.println(separator());
-            IO.print(BOLD + BLUE + "❯" + RESET + " ");
-            IO.flush();
-            String userInput = stdin.readLine();
-            if (userInput == null)
-                break; // EOF
-            userInput = userInput.strip();
-            IO.println(separator());
-
-            if (userInput.isEmpty())
-                continue;
-            if (userInput.equals("/q") || userInput.equals("exit"))
+            System.out.println(sep());
+            System.out.print(BOLD + BLUE + "❯" + RESET + " ");
+            System.out.flush();
+            var input = stdin.readLine();
+            if (input == null)
                 break;
-            if (userInput.equals("/c")) {
+            input = input.strip();
+            System.out.println(sep());
+            if (input.isEmpty())
+                continue;
+            if (input.equals("/q") || input.equals("exit"))
+                break;
+            if (input.equals("/c")) {
                 messages = JSON.createArrayNode();
-                IO.println(GREEN + "⏺ Cleared conversation" + RESET);
+                System.out.println(GREEN + "⏺ Cleared" + RESET);
                 continue;
             }
 
-            var userMsg = JSON.createObjectNode();
-            userMsg.put("role", "user");
-            userMsg.put("content", userInput);
-            messages.add(userMsg);
+            messages.add(JSON.createObjectNode().put("role", "user").put("content", input));
 
-            // Agentic loop: keep calling API until no more tool calls
             while (true) {
                 var response = callApi(messages, systemPrompt);
-                var contentBlocks = response.get("content");
+                var content = response.get("content");
                 var toolResults = JSON.createArrayNode();
 
-                for (var block : contentBlocks) {
-                    var type = block.get("type").asText();
+                for (var block : content) {
+                    if ("text".equals(block.get("type").asText()))
+                        System.out.println("\n" + CYAN + "⏺" + RESET + " "
+                                + block.get("text").asText().replaceAll("\\*\\*(.+?)\\*\\*", BOLD + "$1" + RESET));
 
-                    if ("text".equals(type)) {
-                        IO.println("\n" + CYAN + "⏺" + RESET + " " + renderMarkdown(block.get("text").asText()));
-                    }
-
-                    if ("tool_use".equals(type)) {
-                        var toolName = block.get("name").asText();
+                    if ("tool_use".equals(block.get("type").asText())) {
+                        var name = block.get("name").asText();
                         var toolArgs = block.get("input");
-                        // Preview: first argument value, max 50 chars
-                        String argPreview = "";
-                        var fields = toolArgs.fields();
-                        if (fields.hasNext()) {
-                            argPreview = fields.next().getValue().asText();
-                            if (argPreview.length() > 50)
-                                argPreview = argPreview.substring(0, 50);
-                        }
-                        IO.println("\n" + GREEN + "⏺ " + capitalize(toolName) + RESET
-                                + "(" + DIM + argPreview + RESET + ")");
+                        var argPreview = toolArgs.fields().hasNext() ? toolArgs.fields().next().getValue().asText()
+                                : "";
+                        System.out
+                                .println("\n" + GREEN + "⏺ " + Character.toUpperCase(name.charAt(0)) + name.substring(1)
+                                        + RESET + "(" + DIM + argPreview.substring(0, Math.min(50, argPreview.length()))
+                                        + RESET + ")");
 
-                        var result = runTool(toolName, toolArgs);
-                        var resultLines = result.split("\n");
-                        var preview = resultLines[0].length() > 60 ? resultLines[0].substring(0, 60) : resultLines[0];
-                        if (resultLines.length > 1) {
-                            preview += " ... +" + (resultLines.length - 1) + " lines";
-                        } else if (resultLines[0].length() > 60) {
-                            preview += "...";
-                        }
-                        IO.println("  " + DIM + "⎿  " + preview + RESET);
+                        var result = runTool(name, toolArgs);
+                        System.out.println("  " + DIM + "⎿  " + preview(result, 60) + RESET);
 
-                        var tr = JSON.createObjectNode();
-                        tr.put("type", "tool_result");
-                        tr.put("tool_use_id", block.get("id").asText());
-                        tr.put("content", result);
-                        toolResults.add(tr);
+                        toolResults.add(JSON.createObjectNode().put("type", "tool_result")
+                                .put("tool_use_id", block.get("id").asText()).put("content", result));
                     }
                 }
 
-                var assistantMsg = JSON.createObjectNode();
-                assistantMsg.put("role", "assistant");
-                assistantMsg.set("content", contentBlocks);
-                messages.add(assistantMsg);
-
+                messages.add(JSON.createObjectNode().put("role", "assistant").<ObjectNode>set("content", content));
                 if (toolResults.isEmpty())
                     break;
-
-                var toolMsg = JSON.createObjectNode();
-                toolMsg.put("role", "user");
-                toolMsg.set("content", toolResults);
-                messages.add(toolMsg);
+                messages.add(JSON.createObjectNode().put("role", "user").<ObjectNode>set("content", toolResults));
             }
-
-            IO.println();
-
+            System.out.println();
         } catch (Exception e) {
             if (e instanceof EOFException)
                 break;
-            IO.println(RED + "⏺ Error: " + e.getMessage() + RESET);
+            System.out.println(RED + "⏺ Error: " + e.getMessage() + RESET);
         }
     }
-}
-
-static String capitalize(String s) {
-    return s.isEmpty() ? s : Character.toUpperCase(s.charAt(0)) + s.substring(1);
 }
